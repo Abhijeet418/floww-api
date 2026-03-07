@@ -219,7 +219,3 @@ src/main/java/com/floww/exchange/
 ```
 
 ---
-
-## License
-
-MIT

@@ -37,8 +37,6 @@ services:
   redis:
     image: redis:7-alpine
     command: redis-server --maxmemory 100mb --maxmemory-policy allkeys-lru
-    volumes:
-      - redis_data:/var/lib/redis/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -48,4 +46,3 @@ services:
 
 volumes:
   timescale_data:
-  redis_data:

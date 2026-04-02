@@ -27,7 +27,7 @@ public class HistoricalDataSeeder implements ApplicationRunner {
     @Override
     public void run(ApplicationArguments args) {
         log.info("═══════════════════════════════════════════════════════");
-        log.info("  Floww Historical Data Seeder — 5-Year GBM Backfill ");
+        log.info("  Floww Historical Data Seeder — 5-Year Backfill (1d + 1w) ");
         log.info("═══════════════════════════════════════════════════════");
 
         generator.generateAndWrite(writer);

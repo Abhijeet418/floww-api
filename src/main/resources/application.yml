@@ -2,14 +2,19 @@ spring:
   application:
     name: floww-exchange
 
+  threads:
+    virtual:
+      enabled: true
+
   datasource:
     url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/floww}
     username: ${SPRING_DATASOURCE_USERNAME:floww}
     password: ${SPRING_DATASOURCE_PASSWORD:floww_secret}
     hikari:
-      maximum-pool-size: 40
-      minimum-idle: 10
-      connection-timeout: 5000
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 10000
+      leak-detection-threshold: 30000
 
   jpa:
     hibernate:
@@ -37,17 +42,20 @@ spring:
 floww:
   exchange:
     type: SIMULATED
-    admin-token: ${ADMIN_TOKEN}
+    admin-token: ${ADMIN_TOKEN:super-secret-admin-token}
     api-key-prefix: "flw_"
     api-key-length: 48
     rate-limit:
       orders-per-second: 20
       order-burst-capacity: 50
       order-burst-window-seconds: 10
-      global-requests-per-second: 100
+      global-requests-per-second: 50
       registrations-per-ip-per-day: 1
       max-open-orders: 100000
       cancellations-per-minute: 1000
+      public-requests-per-ip-per-second: 30
+      status-checks-per-ip-per-day: 10
+      sse-max-connections-per-client: 120
     circuit-breaker:
       threshold-percent: 20
       halt-duration-minutes: 15
@@ -57,30 +65,36 @@ floww:
       max-retries: 5
       initial-backoff-ms: 1000
       simulator-key-hashes:
-        # Add SHA-256 hashes of your simulator API keys here.
-        # Example: - "<sha256-hash-of-your-simulator-api-key>"
+        - "3b797a781b071e0fb2525bddb4a35a920703c7640cde4e13319543d7b15b6500"
+        - "bb9484f3e9eafb2819a3dd3373eaa0eff50b4e52ebbd13045ab9d94cdd2e4e5c"
+        - "eaf70c42ff8c5782547a411a038ba587bc58507421ba3e63c9b676650443751b"
+        - "10b611faf48058abc0448e9ce92d6eceb31a3f10a79d46b6d3261870755e688c"
+        - "476e36506ad0bb365b55c32996e1ba92ef9c2bb9ad933e06170cbe5a8a44ba93"
     snapshot:
       interval-seconds: 5
     market-hours:
-      open-time: "09:15"
-      close-time: "15:30"
-      timezone: "Asia/Kolkata"
+      open-time: "03:30"
+      close-time: "09:30"
+      timezone: "UTC"
 
 server:
-  port: 8081
-  tomcat.threads.max: 500
+  port: 8080
+  tomcat:
+    threads:
+      max: 50
+      min-spare: 4
 
 management:
   endpoints:
     web:
       exposure:
-        include: health,metrics,info
+        include: health
   endpoint:
     health:
-      show-details: always
+      show-details: never
 
 logging:
   level:
     com.floww.exchange: INFO
     org.hibernate.SQL: WARN
-    org.springframework.web: DEBUG
+    org.springframework.web: WARN

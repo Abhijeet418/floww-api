@@ -42,21 +42,12 @@ public class MarketSessionService {
         log.info("Market hours: {} – {} ({})", openTime, closeTime, zone);
     }
 
-    /**
-     * Returns true if the market is currently within trading hours.
-     * Weekends (Sat/Sun) are always closed.
-     */
     public boolean isMarketOpen() {
         ZonedDateTime now = ZonedDateTime.now(zone);
         DayOfWeek day = now.getDayOfWeek();
-
-        // Weekends
-        if (day == DayOfWeek.SATURDAY || day == DayOfWeek.SUNDAY) {
-            return false;
-        }
-
-        LocalTime current = now.toLocalTime();
-        return !current.isBefore(openTime) && current.isBefore(closeTime);
+        if (day == DayOfWeek.SATURDAY || day == DayOfWeek.SUNDAY) return false;
+        LocalTime t = now.toLocalTime();
+        return !t.isBefore(openTime) && t.isBefore(closeTime);
     }
 
     /**

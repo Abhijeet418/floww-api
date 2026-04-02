@@ -20,6 +20,8 @@ public class MarketDataBroadcastHandler implements EventHandler<TradeEventHolder
 
     @Override
     public void onEvent(TradeEventHolder holder, long sequence, boolean endOfBatch) {
+        // Skip cancellation-only events (no trade data)
+        if (holder.tradeId == null) return;
         try {
             MarketDataEvent event = MarketDataEvent.builder()
                     .type("TRADE")

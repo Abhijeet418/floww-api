@@ -40,9 +40,26 @@ public class TradePersistenceHandler implements EventHandler<TradeEventHolder> {
     // Local to this single consumer thread — no synchronization needed
     private final List<Trade>        tradeBatch  = new ArrayList<>(MAX_BATCH);
     private final List<OrderUpdate>  orderBatch  = new ArrayList<>(MAX_BATCH);
+    private final List<CancelledOrder> cancelBatch = new ArrayList<>();
 
     @Override
     public void onEvent(TradeEventHolder holder, long sequence, boolean endOfBatch) {
+        // Handle unfilled market order cancellation signals
+        if (holder.cancelledOrderId != null && holder.tradeId == null) {
+            cancelBatch.add(new CancelledOrder(
+                    holder.cancelledOrderId,
+                    holder.cancelledOrderAppId,
+                    holder.cancelledOrderOriginalQty,
+                    holder.cancelledOrderFilledQty));
+            if (endOfBatch || cancelBatch.size() >= MAX_BATCH) {
+                flush();
+            }
+            return;
+        }
+
+        // Skip empty events (e.g. pure cancel signals already handled)
+        if (holder.tradeId == null) return;
+
         // 1. Snapshot trade data out of the ring buffer slot
         tradeBatch.add(Trade.builder()
                 .tradeId(holder.tradeId)
@@ -94,6 +111,10 @@ public class TradePersistenceHandler implements EventHandler<TradeEventHolder> {
                 List<UUID> ids = orderBatch.stream().map(u -> u.orderId).toList();
                 List<com.floww.exchange.model.entity.ExchangeOrder> orders =
                         orderRepository.findAllById(ids);
+                if (orders.size() < ids.size()) {
+                    log.warn("findAllById returned {}/{} orders — {} missing from DB",
+                            orders.size(), ids.size(), ids.size() - orders.size());
+                }
                 for (com.floww.exchange.model.entity.ExchangeOrder order : orders) {
                     OrderUpdate upd = orderBatch.stream()
                             .filter(u -> u.orderId.equals(order.getOrderId()))
@@ -114,7 +135,34 @@ public class TradePersistenceHandler implements EventHandler<TradeEventHolder> {
                 orderBatch.clear();
             }
         }
+
+        if (!cancelBatch.isEmpty()) {
+            try {
+                List<UUID> cancelIds = cancelBatch.stream().map(c -> c.orderId).toList();
+                List<com.floww.exchange.model.entity.ExchangeOrder> orders =
+                        orderRepository.findAllById(cancelIds);
+                if (orders.size() < cancelIds.size()) {
+                    log.warn("Cancel findAllById returned {}/{} orders",
+                            orders.size(), cancelIds.size());
+                }
+                for (com.floww.exchange.model.entity.ExchangeOrder order : orders) {
+                    CancelledOrder cancel = cancelBatch.stream()
+                            .filter(c -> c.orderId.equals(order.getOrderId()))
+                            .findFirst().orElse(null);
+                    if (cancel == null) continue;
+                    order.setFilledQty(cancel.filledQty);
+                    order.setStatus(OrderStatus.CANCELLED);
+                    rateLimitService.decrementOpenOrders(cancel.appId);
+                }
+                orderRepository.saveAll(orders);
+            } catch (Exception e) {
+                log.error("Batch market-order cancel update failed: {}", e.getMessage(), e);
+            } finally {
+                cancelBatch.clear();
+            }
+        }
     }
 
     private record OrderUpdate(UUID orderId, long remainingQty, long originalQty) {}
+    private record CancelledOrder(UUID orderId, UUID appId, long originalQty, long filledQty) {}
 }

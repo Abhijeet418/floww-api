@@ -1,51 +1,68 @@
 package com.floww.exchange.service;
 
-import com.floww.exchange.model.enums.OrderStatus;
-import com.floww.exchange.repository.OrderRepository;
+import com.floww.exchange.engine.MatchingEngine;
+import com.floww.exchange.engine.OrderBook;
+import com.floww.exchange.engine.OrderBookEntry;
+import com.floww.exchange.engine.disruptor.DisruptorConfig;
+import com.floww.exchange.engine.disruptor.OrderEventHolder;
+import com.lmax.disruptor.RingBuffer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Handles end-of-day maintenance for the exchange.
- * * At market close, we cancel all resting orders that are not intended 
- * for long-term persistence (GTC). This keeps the recovery process 
- * fast and prevents memory bloat in the matching engine.
+ *
+ * At market close, publishes CANCEL events through the Disruptor for every
+ * resting order, ensuring the engine and the database stay in sync.
+ * The previous raw-SQL approach caused a split-brain where the DB said orders
+ * were cancelled but the engine still held them in memory.
  */
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class MarketCleanupService {
 
-    private final JdbcTemplate jdbcTemplate;
-    private final RateLimitService rateLimitService;
+    private final MatchingEngine matchingEngine;
+    private final DisruptorConfig disruptorConfig;
+    private final SnapshotService snapshotService;
 
-    // Runs at 15:31 (3:31 PM) Monday-Friday, Asia/Kolkata timezone
-    @Scheduled(cron = "0 31 15 * * MON-FRI", zone = "Asia/Kolkata")
-    @Transactional
+    // Runs at 10:31 UTC Monday-Friday (1 minute after market close)
+    @Scheduled(cron = "0 31 9 * * MON-FRI", zone = "UTC")
     public void performEndOfDayCleanup() {
-        log.info("Starting Market Close Cleanup: Purging non-persistent orders...");
+        log.info("Starting Market Close Cleanup: Cancelling all resting orders via Disruptor...");
 
-        // 1. Identify orders to cancel (OPEN or PARTIALLY_FILLED)
-        // We cancel everything that isn't a long-term "Good 'Til Cancelled" order.
-        // For your current setup, we'll cancel most to keep the book fresh.
-        String sql = "UPDATE exchange_order " +
-                     "SET status = 'CANCELLED', updated_at = NOW() " +
-                     "WHERE status IN ('OPEN', 'PARTIALLY_FILLED')";
+        Set<String> tickers = snapshotService.getKnownTickers();
+        RingBuffer<OrderEventHolder> ringBuffer = disruptorConfig.getOrderRingBuffer();
+        int cancelledCount = 0;
 
-        int cancelledCount = jdbcTemplate.update(sql);
+        for (String ticker : tickers) {
+            OrderBook book = matchingEngine.getOrderBook(ticker);
+            if (book == null) continue;
 
-        // 2. Clear Redis Open Order Counters
-        // This ensures rate limits reset correctly for the next trading day
-        log.info("Resetting open order counters for all apps...");
-        // You can clear the specific Redis pattern if your RateLimitService supports it
-        
-        log.info("Cleanup complete. {} orders moved to CANCELLED status.", cancelledCount);
+            List<OrderBookEntry> restingOrders = book.getAllRestingOrders();
+            for (OrderBookEntry entry : restingOrders) {
+                long sequence = ringBuffer.next();
+                try {
+                    OrderEventHolder holder = ringBuffer.get(sequence);
+                    holder.action    = OrderEventHolder.Action.CANCEL;
+                    holder.orderId   = entry.getOrderId();
+                    holder.ticker    = ticker;
+                    holder.appId     = entry.getAppId();
+                    holder.timestamp = Instant.now();
+                } finally {
+                    ringBuffer.publish(sequence);
+                }
+                cancelledCount++;
+            }
+        }
+
+        log.info("Cleanup complete. {} cancel events published to Disruptor.", cancelledCount);
     }
 
     /**

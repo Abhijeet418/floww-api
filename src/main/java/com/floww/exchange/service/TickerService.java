@@ -82,12 +82,12 @@ public class TickerService {
     }
 
     /**
-     * Runs at market open (09:15 IST, Mon–Fri).
+     * Runs at market open (03:30 UTC, Mon–Fri).
      * Snapshots each active ticker's current LTP into sessionOpenPrice so that
      * price-deviation checks use today's actual open as the reference price.
      * Tickers with no trades yet keep their existing sessionOpenPrice (initial seed).
      */
-    @Scheduled(cron = "0 15 9 * * MON-FRI", zone = "Asia/Kolkata")
+    @Scheduled(cron = "0 30 3 * * MON-FRI", zone = "UTC")
     @Transactional
     public void snapshotSessionOpenPrices() {
         List<Ticker> active = tickerRepository.findByStatus(TickerStatus.ACTIVE);

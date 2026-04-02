@@ -1,6 +1,7 @@
 package com.floww.exchange.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.floww.exchange.config.ExchangeProperties;
 import com.floww.exchange.model.dto.MarketDataEvent;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -10,6 +11,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.List;
+import java.util.Deque;
 import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -20,18 +22,19 @@ import java.util.concurrent.atomic.AtomicLong;
 @Slf4j
 public class MarketDataService {
 
-    private static final int MAX_SSE_CONNECTIONS_PER_CLIENT = 120;
-
     private final ObjectMapper objectMapper;
     private final MarketSessionService marketSessionService;
     private final StringRedisTemplate redisTemplate;
+    private final ExchangeProperties exchangeProperties;
 
     private final Map<String, List<SseEmitter>> emitters = new ConcurrentHashMap<>();
     private final Map<String, MarketDataEvent> latestData = new ConcurrentHashMap<>();
 
-    // Ring buffer for replay (per ticker, last 1000 events)
-    private final Map<String, List<MarketDataEvent>> eventBuffer = new ConcurrentHashMap<>();
+    // Ring buffer for replay (per ticker, last ~1000 events)
+    // ConcurrentLinkedDeque avoids the O(n) array copy per mutation of CopyOnWriteArrayList.
+    private final Map<String, Deque<MarketDataEvent>> eventBuffer = new ConcurrentHashMap<>();
     private final AtomicLong eventIdCounter = new AtomicLong(0);
+    private final ExecutorService sseExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
     // Connection count per client key (appId when authenticated, remote IP otherwise)
     private final Map<String, AtomicInteger> connectionCount = new ConcurrentHashMap<>();
@@ -55,12 +58,13 @@ public class MarketDataService {
     }
 
     public SseEmitter subscribe(String ticker, String lastEventId, String clientKey) {
+        int maxConnections = exchangeProperties.getRateLimit().getSseMaxConnectionsPerClient();
         AtomicInteger count = connectionCount.computeIfAbsent(clientKey, k -> new AtomicInteger(0));
-        if (count.incrementAndGet() > MAX_SSE_CONNECTIONS_PER_CLIENT) {
+        if (count.incrementAndGet() > maxConnections) {
             count.decrementAndGet();
             SseEmitter rejected = new SseEmitter(0L);
             rejected.completeWithError(new IllegalStateException(
-                    "SSE connection limit reached (max " + MAX_SSE_CONNECTIONS_PER_CLIENT + ")"));
+                    "SSE connection limit reached (max " + maxConnections + ")"));
             return rejected;
         }
 
@@ -92,7 +96,7 @@ public class MarketDataService {
         if (lastEventId != null) {
             try {
                 long fromId = Long.parseLong(lastEventId);
-                List<MarketDataEvent> buffer = eventBuffer.get(ticker);
+                Deque<MarketDataEvent> buffer = eventBuffer.get(ticker);
                 if (buffer != null) {
                     // This is a simplified replay — just send latest
                     MarketDataEvent latest = latestData.get(ticker);
@@ -115,26 +119,33 @@ public class MarketDataService {
         latestData.put(ticker, event);
         long eventId = eventIdCounter.incrementAndGet();
 
-        // Add to ring buffer
-        eventBuffer.computeIfAbsent(ticker, k -> new CopyOnWriteArrayList<>()).add(event);
-        List<MarketDataEvent> buffer = eventBuffer.get(ticker);
-        if (buffer.size() > 1000) {
-            // Trim oldest entries
-            while (buffer.size() > 800) buffer.remove(0);
-        }
+        // Add to ring buffer (ConcurrentLinkedDeque — O(1) addLast/removeFirst, no array copies)
+        Deque<MarketDataEvent> buffer = eventBuffer.computeIfAbsent(ticker, k -> new ConcurrentLinkedDeque<>());
+        buffer.addLast(event);
+        // Trim from the head — each removeFirst is O(1), no array reallocation
+        while (buffer.size() > 1000) buffer.pollFirst();
 
         List<SseEmitter> tickerEmitters = emitters.get(ticker);
         if (tickerEmitters == null || tickerEmitters.isEmpty()) return;
 
+        String eventJson;
+        try {
+            eventJson = objectMapper.writeValueAsString(event);
+        } catch (Exception e) {
+            return;
+        }
+
         for (SseEmitter emitter : tickerEmitters) {
-            try {
-                emitter.send(SseEmitter.event()
-                        .id(String.valueOf(eventId))
-                        .name("market-data")
-                        .data(objectMapper.writeValueAsString(event)));
-            } catch (Exception e) {
-                removeEmitter(ticker, emitter);
-            }
+            sseExecutor.submit(() -> {
+                try {
+                    emitter.send(SseEmitter.event()
+                            .id(String.valueOf(eventId))
+                            .name("market-data")
+                            .data(eventJson));
+                } catch (Exception e) {
+                    removeEmitter(ticker, emitter);
+                }
+            });
         }
     }
 
@@ -175,5 +186,15 @@ public class MarketDataService {
     private void removeEmitter(String ticker, SseEmitter emitter) {
         List<SseEmitter> list = emitters.get(ticker);
         if (list != null) list.remove(emitter);
+    }
+
+    /**
+     * Prune empty emitter lists and zero-count connection entries every 60s
+     * to prevent unbounded map growth from disconnected clients.
+     */
+    @Scheduled(fixedRate = 60000)
+    public void pruneStaleEntries() {
+        emitters.entrySet().removeIf(e -> e.getValue().isEmpty());
+        connectionCount.entrySet().removeIf(e -> e.getValue().get() <= 0);
     }
 }

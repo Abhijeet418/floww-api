@@ -8,6 +8,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.Map;
 import java.util.Optional;
@@ -66,5 +67,25 @@ public class TickerCache {
         if (ltp != null) return ltp;
         Ticker t = tickers.get(symbol);
         return t != null ? t.getSessionOpenPrice() : null;
+    }
+
+    /**
+     * Halts a ticker due to circuit breaker. Persists to DB first,
+     * then updates in-memory state. If the DB save fails, in-memory stays clean
+     * so we don't get a ghost halt that isn't durable.
+     */
+    @Transactional
+    public void haltTicker(String symbol, String reason) {
+        Ticker cached = tickers.get(symbol);
+        if (cached == null) return;
+        Ticker dbTicker = tickerRepository.findBySymbol(symbol).orElse(null);
+        if (dbTicker == null) return;
+        dbTicker.setStatus(TickerStatus.HALTED);
+        dbTicker.setHaltReason(reason);
+        tickerRepository.save(dbTicker);
+        // DB succeeded — now safe to update cache
+        cached.setStatus(TickerStatus.HALTED);
+        cached.setHaltReason(reason);
+        log.warn("CIRCUIT BREAKER — {} halted: {}", symbol, reason);
     }
 }

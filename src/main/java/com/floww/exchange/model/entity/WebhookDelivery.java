@@ -2,6 +2,8 @@ package com.floww.exchange.model.entity;
 
 import jakarta.persistence.*;
 import lombok.*;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -20,6 +22,7 @@ public class WebhookDelivery {
     @Column(name = "trade_id", nullable = false)
     private UUID tradeId;
 
+    @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "payload", nullable = false, columnDefinition = "jsonb")
     private String payload;
 

@@ -40,9 +40,7 @@ public class GbmCandleGenerator {
             return;
         }
 
-        log.info("Generating {} years of MACRO candles (1d to 5y) for {} tickers...", YEARS, tickers.size());
-
-        int totalDays = YEARS * TRADING_DAYS_PER_YEAR;
+        log.info("Generating {} years of candles (1d + 1w) for {} tickers...", YEARS, tickers.size());
 
         for (Ticker ticker : tickers) {
             long startTime = System.currentTimeMillis();
@@ -59,11 +57,11 @@ public class GbmCandleGenerator {
 
             LocalDate startDate = LocalDate.now().minusYears(YEARS);
             LocalDate currentDate = startDate;
+            LocalDate endDate = LocalDate.now();
 
-            List<long[]> dailyCandles = new ArrayList<>(totalDays);
+            List<long[]> dailyCandles = new ArrayList<>(1400);
 
-            int dayCount = 0;
-            while (dayCount < totalDays) {
+            while (!currentDate.isAfter(endDate)) {
                 if (currentDate.getDayOfWeek() == DayOfWeek.SATURDAY || currentDate.getDayOfWeek() == DayOfWeek.SUNDAY) {
                     currentDate = currentDate.plusDays(1);
                     continue;
@@ -99,33 +97,14 @@ public class GbmCandleGenerator {
                 });
 
                 currentDate = currentDate.plusDays(1);
-                dayCount++;
             }
 
             // 1. Write Base Daily Candles
             writer.writeBatch(ticker.getSymbol(), "1d", dailyCandles);
 
-            // 2. Aggregate into Macro Timeframes using Calendar math
+            // 2. Aggregate into Weekly candles
             writeAggregated(writer, ticker.getSymbol(), "1w", dailyCandles, 
                 d -> d.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY)));
-            
-            writeAggregated(writer, ticker.getSymbol(), "1mo", dailyCandles, 
-                d -> d.withDayOfMonth(1));
-            
-            writeAggregated(writer, ticker.getSymbol(), "3mo", dailyCandles, 
-                d -> d.withMonth(((d.getMonthValue() - 1) / 3) * 3 + 1).withDayOfMonth(1));
-            
-            writeAggregated(writer, ticker.getSymbol(), "6mo", dailyCandles, 
-                d -> d.withMonth(((d.getMonthValue() - 1) / 6) * 6 + 1).withDayOfMonth(1));
-            
-            writeAggregated(writer, ticker.getSymbol(), "1y", dailyCandles, 
-                d -> d.withDayOfYear(1));
-            
-            writeAggregated(writer, ticker.getSymbol(), "3y", dailyCandles, 
-                d -> d.withYear((d.getYear() / 3) * 3).withDayOfYear(1));
-            
-            writeAggregated(writer, ticker.getSymbol(), "5y", dailyCandles, 
-                d -> d.withYear((d.getYear() / 5) * 5).withDayOfYear(1));
 
             long elapsed = System.currentTimeMillis() - startTime;
             log.info("  {} — Done generating all resolutions in {}ms", ticker.getSymbol(), elapsed);

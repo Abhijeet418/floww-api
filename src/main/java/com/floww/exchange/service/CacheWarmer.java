@@ -2,6 +2,7 @@ package com.floww.exchange.service;
 
 import com.floww.exchange.model.entity.RegisteredApp;
 import com.floww.exchange.model.enums.AppStatus;
+import com.floww.exchange.repository.OrderRepository;
 import com.floww.exchange.repository.RegisteredAppRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -22,11 +23,12 @@ import java.util.List;
 public class CacheWarmer implements CommandLineRunner {
 
     private final RegisteredAppRepository appRepository;
+    private final OrderRepository orderRepository;
     private final StringRedisTemplate redisTemplate;
 
     @Override
     public void run(String... args) {
-        log.info("🔥 [BOOT] Starting Cache Warmer: Syncing ACTIVE apps from DB to Redis...");
+        log.info("[BOOT] Starting cache warmer: syncing active apps from DB to Redis...");
 
         // Fetch all active apps (using the existing repository method)
         List<RegisteredApp> activeApps = appRepository.findByStatusOrderByCreatedAtDesc(AppStatus.ACTIVE);
@@ -44,6 +46,13 @@ public class CacheWarmer implements CommandLineRunner {
             }
         }
 
-        log.info("✅ [BOOT] Cache Warmer finished! Hydrated Redis with {} active API keys.", count);
+        log.info("[BOOT] Cache warmer finished. Loaded {} active API keys into Redis.", count);
+
+        // Sync open order counts from DB to Redis to prevent counter drift
+        for (RegisteredApp app : activeApps) {
+            long openCount = orderRepository.countOpenOrders(app.getAppId());
+            redisTemplate.opsForValue().set("ratelimit:open:" + app.getAppId(), String.valueOf(openCount));
+        }
+        log.info("[BOOT] Open order counters synced for {} apps.", activeApps.size());
     }
 }

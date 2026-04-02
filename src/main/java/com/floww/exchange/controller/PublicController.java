@@ -68,9 +68,11 @@ public class PublicController {
     @GetMapping("/tickers/{symbol}/candles")
     public ResponseEntity<ApiResponse<List<CandleResponse>>> getCandles(
             @PathVariable String symbol,
-            @RequestParam(defaultValue = "1m") String resolution,
-            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant from,
-            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant to) {
+            @RequestParam(defaultValue = "1d") String resolution,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant from,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant to) {
+        if (to == null) to = Instant.now();
+        if (from == null) from = to.minusSeconds(90L * 86400); // default 90 days
         return ResponseEntity.ok(ApiResponse.ok(candleService.getCandles(symbol, resolution, from, to)));
     }
 

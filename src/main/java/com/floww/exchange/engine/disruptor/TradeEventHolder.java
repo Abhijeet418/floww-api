@@ -35,6 +35,13 @@ public class TradeEventHolder {
     public Long bestBid;
     public Long bestAsk;
 
+    // Unfilled market order cancellation signal
+    // When set, this event is not a trade but a cancellation of the unfilled remainder.
+    public UUID cancelledOrderId;
+    public UUID cancelledOrderAppId;
+    public long cancelledOrderOriginalQty;
+    public long cancelledOrderFilledQty;
+
     public void clear() {
         tradeId = null;
         ticker = null;
@@ -55,5 +62,9 @@ public class TradeEventHolder {
         sessionVolume = 0;
         bestBid = null;
         bestAsk = null;
+        cancelledOrderId = null;
+        cancelledOrderAppId = null;
+        cancelledOrderOriginalQty = 0;
+        cancelledOrderFilledQty = 0;
     }
 }

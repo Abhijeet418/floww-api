@@ -78,6 +78,12 @@
             <artifactId>spring-security-crypto</artifactId>
         </dependency>
 
+        <!-- Caffeine (high-performance in-memory cache for dedup, etc.) -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
+
         <!-- Lombok -->
         <dependency>
             <groupId>org.projectlombok</groupId>

@@ -27,6 +27,10 @@ public class SnapshotService {
         knownTickers.add(ticker);
     }
 
+    public Set<String> getKnownTickers() {
+        return Set.copyOf(knownTickers);
+    }
+
     @Scheduled(fixedRateString = "${floww.exchange.snapshot.interval-seconds:5}000")
     public void snapshotAll() {
         for (String ticker : knownTickers) {

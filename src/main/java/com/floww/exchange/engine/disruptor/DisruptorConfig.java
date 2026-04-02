@@ -3,8 +3,7 @@ package com.floww.exchange.engine.disruptor;
 import com.lmax.disruptor.EventHandler;
 import com.lmax.disruptor.dsl.Disruptor;
 import com.lmax.disruptor.dsl.ProducerType;
-import com.lmax.disruptor.BusySpinWaitStrategy;
-import com.lmax.disruptor.YieldingWaitStrategy;
+import com.lmax.disruptor.SleepingWaitStrategy;
 import com.lmax.disruptor.RingBuffer;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -74,7 +73,7 @@ public class DisruptorConfig {
                 ORDER_BUFFER_SIZE,
                 namedThreadFactory("disruptor-order"),
                 ProducerType.MULTI,
-                new YieldingWaitStrategy()
+                new SleepingWaitStrategy()
         );
         orderDisruptor
                 .handleEventsWith(orderEventHandler, orderPersistenceHandler)
@@ -90,7 +89,7 @@ public class DisruptorConfig {
                 TRADE_BUFFER_SIZE,
                 namedThreadFactory("disruptor-trade"),
                 ProducerType.SINGLE,
-                new YieldingWaitStrategy()
+                new SleepingWaitStrategy()
         );
         // All handlers consume in parallel (independent consumers)
         tradeDisruptor.handleEventsWith(

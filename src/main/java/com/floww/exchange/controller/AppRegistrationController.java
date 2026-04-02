@@ -26,7 +26,8 @@ public class AppRegistrationController {
     public ResponseEntity<ApiResponse<RegisterAppResponse>> register(
             @Valid @RequestBody RegisterAppRequest request,
             HttpServletRequest httpRequest) {
-        rateLimitService.checkRegistrationRateByIp(extractClientIp(httpRequest));
+        String ip = extractClientIp(httpRequest);
+        rateLimitService.checkRegistrationRateByIp(ip);
         return ResponseEntity.status(HttpStatus.CREATED)
                 .body(ApiResponse.ok(registrationService.register(request)));
     }
@@ -45,7 +46,10 @@ public class AppRegistrationController {
 
     @PostMapping("/status")
     public ResponseEntity<ApiResponse<AppSummary>> checkStatus(
-            @RequestBody AppStatusCheckRequest request) {
+            @RequestBody AppStatusCheckRequest request,
+            HttpServletRequest httpRequest) {
+        String ip = extractClientIp(httpRequest);
+        rateLimitService.checkStatusCheckRate(ip);
         return ResponseEntity.ok(ApiResponse.ok(registrationService.checkStatus(request.getApiKey())));
     }
 }

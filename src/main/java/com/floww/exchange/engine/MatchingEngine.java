@@ -2,14 +2,18 @@ package com.floww.exchange.engine;
 
 import com.floww.exchange.engine.disruptor.DisruptorConfig;
 import com.floww.exchange.engine.disruptor.TradeEventHolder;
-import com.floww.exchange.model.dto.MarketDataEvent;
+import com.floww.exchange.exception.OrderRejectedException;
+import com.floww.exchange.model.entity.Ticker;
 import com.floww.exchange.model.dto.OrderBookSnapshot;
+import com.floww.exchange.model.dto.OrderResponse;
 import com.floww.exchange.model.enums.OrderStatus;
+import com.floww.exchange.model.enums.OrderType;
 import com.floww.exchange.model.event.OrderEvent;
 import com.floww.exchange.model.event.TradeEvent;
-import com.floww.exchange.repository.OrderRepository;
+import com.floww.exchange.service.OrderFutureRegistry;
 import com.floww.exchange.service.RateLimitService;
 import com.floww.exchange.service.SnapshotService;
+import com.floww.exchange.service.TickerCache;
 import com.lmax.disruptor.RingBuffer;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Lazy;
@@ -19,12 +23,13 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Matching Engine — consumes OrderEvents from the Disruptor ring buffer,
- * matches via in-memory OrderBooks, publishes TradeEvents to the trade
- * Disruptor for async persistence, OHLCV aggregation, and webhook dispatch.
+ * Matching Engine — the single-threaded brain of the exchange.
  *
- * All order book state is in-memory. DB writes happen asynchronously
- * on separate Disruptor consumer threads.
+ * Consumes OrderEvents from the Ingress Disruptor, matches via in-memory
+ * OrderBooks, publishes TradeEvents to the Egress Disruptor, and completes
+ * the CompletableFuture so the HTTP thread returns the authoritative result.
+ *
+ * The engine is the SOLE source of truth for order state.
  */
 @Service
 @Slf4j
@@ -33,15 +38,21 @@ public class MatchingEngine {
     private final RateLimitService rateLimitService;
     private final SnapshotService snapshotService;
     private final DisruptorConfig disruptorConfig;
+    private final OrderFutureRegistry futureRegistry;
+    private final TickerCache tickerCache;
 
     private final ConcurrentHashMap<String, OrderBook> orderBooks = new ConcurrentHashMap<>();
 
     public MatchingEngine(RateLimitService rateLimitService,
                           @Lazy SnapshotService snapshotService,
-                          @Lazy DisruptorConfig disruptorConfig) {
+                          @Lazy DisruptorConfig disruptorConfig,
+                          OrderFutureRegistry futureRegistry,
+                          TickerCache tickerCache) {
         this.rateLimitService = rateLimitService;
         this.snapshotService = snapshotService;
         this.disruptorConfig = disruptorConfig;
+        this.futureRegistry = futureRegistry;
+        this.tickerCache = tickerCache;
     }
 
     /**
@@ -52,10 +63,7 @@ public class MatchingEngine {
         String ticker = event.getTicker();
         log.debug("[{}] {} orderId={} seq={}", ticker, event.getAction(), event.getOrderId(), event.getSequenceNumber());
 
-        OrderBook book = orderBooks.computeIfAbsent(ticker, t -> {
-            snapshotService.registerTicker(t);
-            return new OrderBook(t);
-        });
+        OrderBook book = getOrCreateBook(ticker);
 
         if (event.getAction() == OrderEvent.Action.CANCEL) {
             handleCancel(book, event);
@@ -65,6 +73,14 @@ public class MatchingEngine {
     }
 
     private void handlePlace(OrderBook book, OrderEvent event) {
+        // ── Circuit breaker: reject if ticker was halted after the gateway check ──
+        if (tickerCache.isHalted(event.getTicker())) {
+            rateLimitService.decrementOpenOrders(event.getAppId());
+            futureRegistry.completeExceptionally(event.getOrderId(),
+                    new OrderRejectedException("Ticker " + event.getTicker() + " is halted"));
+            return;
+        }
+
         OrderBookEntry entry = OrderBookEntry.builder()
                 .orderId(event.getOrderId()).appId(event.getAppId())
                 .traderId(event.getTraderId()).ticker(event.getTicker())
@@ -77,7 +93,14 @@ public class MatchingEngine {
 
         List<TradeEvent> trades = book.processOrder(entry);
 
-        // Publish each trade to the trade Disruptor for async processing
+        // If matching triggered the circuit breaker, halt the ticker immediately
+        if (book.isCircuitBreakerTriggered()) {
+            book.setCircuitBreakerTriggered(false);
+            tickerCache.haltTicker(event.getTicker(),
+                    "Circuit breaker: price deviated >20%% from reference " + book.getReferencePrice());
+        }
+
+        // Publish each trade to the Egress Disruptor for async persistence
         RingBuffer<TradeEventHolder> tradeRing = disruptorConfig.getTradeRingBuffer();
         for (TradeEvent trade : trades) {
             long seq = tradeRing.next();
@@ -109,14 +132,90 @@ public class MatchingEngine {
                 tradeRing.publish(seq);
             }
         }
+
+        // Emit cancellation event for unfilled market orders so DB + rate limiter stay consistent
+        if (event.getOrderType() == OrderType.MARKET && entry.getRemainingQty() > 0) {
+            long cancelSeq = tradeRing.next();
+            try {
+                TradeEventHolder holder = tradeRing.get(cancelSeq);
+                holder.cancelledOrderId = event.getOrderId();
+                holder.cancelledOrderAppId = event.getAppId();
+                holder.cancelledOrderOriginalQty = event.getQty();
+                holder.cancelledOrderFilledQty = event.getQty() - entry.getRemainingQty();
+                holder.ticker = event.getTicker();
+            } finally {
+                tradeRing.publish(cancelSeq);
+            }
+            log.debug("[{}] Market order {} partially filled {}/{}, remainder cancelled",
+                    event.getTicker(), event.getOrderId(),
+                    event.getQty() - entry.getRemainingQty(), event.getQty());
+        }
+
+        // ── Compute the authoritative status and complete the HTTP future ──
+        long filledQty = event.getQty() - entry.getRemainingQty();
+        OrderStatus status;
+        if (entry.getRemainingQty() == 0) {
+            status = OrderStatus.FILLED;
+        } else if (event.getOrderType() == OrderType.MARKET) {
+            // Market orders never rest — unfilled remainder is discarded
+            status = OrderStatus.CANCELLED;
+        } else if (filledQty > 0) {
+            status = OrderStatus.PARTIALLY_FILLED;
+        } else {
+            status = OrderStatus.OPEN;
+        }
+
+        futureRegistry.complete(event.getOrderId(), OrderResponse.builder()
+                .orderId(event.getOrderId())
+                .clientOrderId(event.getClientOrderId())
+                .ticker(event.getTicker())
+                .side(event.getSide())
+                .orderType(event.getOrderType())
+                .price(event.getPrice())
+                .qty(event.getQty())
+                .filledQty(filledQty)
+                .status(status)
+                .sequenceNumber(event.getSequenceNumber())
+                .createdAt(event.getTimestamp())
+                .build());
     }
 
     private void handleCancel(OrderBook book, OrderEvent event) {
-        boolean cancelled = book.cancelOrder(event.getOrderId());
-        if (cancelled) {
+        OrderBookEntry cancelled = book.cancelOrder(event.getOrderId());
+        if (cancelled != null) {
             rateLimitService.decrementOpenOrders(event.getAppId());
             log.debug("[{}] Order cancelled: {}", event.getTicker(), event.getOrderId());
+
+            long filledQty = cancelled.getQty() - cancelled.getRemainingQty();
+            futureRegistry.complete(event.getOrderId(), OrderResponse.builder()
+                    .orderId(cancelled.getOrderId())
+                    .ticker(cancelled.getTicker())
+                    .side(cancelled.getSide())
+                    .orderType(cancelled.getOrderType())
+                    .price(cancelled.getPrice())
+                    .qty(cancelled.getQty())
+                    .filledQty(filledQty)
+                    .status(OrderStatus.CANCELLED)
+                    .sequenceNumber(cancelled.getSequenceNumber())
+                    .createdAt(event.getTimestamp())
+                    .build());
+        } else {
+            // Order not in book (already filled or already cancelled).
+            // Complete with null — the gateway will check the DB for details.
+            futureRegistry.complete(event.getOrderId(), null);
         }
+    }
+
+    private OrderBook getOrCreateBook(String ticker) {
+        return orderBooks.computeIfAbsent(ticker, t -> {
+            snapshotService.registerTicker(t);
+            OrderBook newBook = new OrderBook(t);
+            tickerCache.get(t)
+                    .map(Ticker::getSessionOpenPrice)
+                    .filter(p -> p > 0)
+                    .ifPresent(newBook::setReferencePrice);
+            return newBook;
+        });
     }
 
     /**
@@ -124,10 +223,7 @@ public class MatchingEngine {
      * Inserts directly at the given price level.
      */
     public void replayOrder(OrderBookEntry entry) {
-        OrderBook book = orderBooks.computeIfAbsent(entry.getTicker(), t -> {
-            snapshotService.registerTicker(t);
-            return new OrderBook(t);
-        });
+        OrderBook book = getOrCreateBook(entry.getTicker());
         book.insertWithoutMatching(entry);
     }
 

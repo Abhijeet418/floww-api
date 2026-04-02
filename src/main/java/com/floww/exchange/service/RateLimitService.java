@@ -80,23 +80,31 @@ public class RateLimitService {
         }
     }
 
+    /**
+     * Atomic open-order check: INCR first, then check limit.
+     * If over limit, DECR back and reject. Avoids GET-then-CHECK TOCTOU race.
+     */
     public void checkOpenOrderLimit(UUID appId) {
         String key = "ratelimit:open:" + appId;
-        String val = redisTemplate.opsForValue().get(key);
-        long count = val != null ? Long.parseLong(val) : 0;
-        if (count >= props.getRateLimit().getMaxOpenOrders()) {
+        Long count = redisTemplate.opsForValue().increment(key);
+        if (count != null && count == 1) redisTemplate.expire(key, Duration.ofHours(24));
+        if (count != null && count > props.getRateLimit().getMaxOpenOrders()) {
+            redisTemplate.opsForValue().decrement(key);
             throw new RateLimitExceededException("Max open orders exceeded: " + props.getRateLimit().getMaxOpenOrders());
         }
     }
 
     public void incrementOpenOrders(UUID appId) {
-        redisTemplate.opsForValue().increment("ratelimit:open:" + appId);
+        // No-op: increment now happens inside checkOpenOrderLimit atomically
     }
 
     public void decrementOpenOrders(UUID appId) {
         String key = "ratelimit:open:" + appId;
         Long val = redisTemplate.opsForValue().decrement(key);
-        if (val != null && val < 0) redisTemplate.opsForValue().set(key, "0");
+        if (val != null && val < 0) {
+            redisTemplate.opsForValue().set(key, "0");
+            redisTemplate.expire(key, Duration.ofHours(24));
+        }
     }
 
     public void checkCancelRate(UUID appId) {
@@ -106,6 +114,35 @@ public class RateLimitService {
         if (count != null && count == 1) redisTemplate.expire(key, Duration.ofSeconds(120));
         if (count != null && count > props.getRateLimit().getCancellationsPerMinute()) {
             throw new RateLimitExceededException("Cancellation rate limit exceeded");
+        }
+    }
+
+    /**
+     * Per-IP rate limit for all public (unauthenticated) endpoints.
+     * Prevents DDoS on /tickers, /market-data, /candles, /orderbook, etc.
+     */
+    public void checkPublicRate(String ip) {
+        long epoch = System.currentTimeMillis() / 1000;
+        String key = "ratelimit:public:ip:" + ip + ":" + epoch;
+        Long count = redisTemplate.opsForValue().increment(key);
+        if (count != null && count == 1) redisTemplate.expire(key, Duration.ofSeconds(2));
+        if (count != null && count > props.getRateLimit().getPublicRequestsPerIpPerSecond()) {
+            throw new RateLimitExceededException(
+                "Public rate limit exceeded: max " + props.getRateLimit().getPublicRequestsPerIpPerSecond() + " req/sec per IP");
+        }
+    }
+
+    /**
+     * Rate limit for POST /api/apps/status — prevents API key probing.
+     */
+    public void checkStatusCheckRate(String ip) {
+        long epochDay = System.currentTimeMillis() / 86_400_000L;
+        String key = "ratelimit:status:ip:" + ip + ":" + epochDay;
+        Long count = redisTemplate.opsForValue().increment(key);
+        if (count != null && count == 1) redisTemplate.expire(key, Duration.ofDays(2));
+        if (count != null && count > props.getRateLimit().getStatusChecksPerIpPerDay()) {
+            throw new RateLimitExceededException(
+                "Status check limit exceeded: max " + props.getRateLimit().getStatusChecksPerIpPerDay() + " per IP per day");
         }
     }
 }

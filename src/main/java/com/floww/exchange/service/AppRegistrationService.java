@@ -41,7 +41,7 @@ public class AppRegistrationService {
         String keyHash = apiKeyService.hashKey(rawKey);
 
         String webhookUrl = request.getWebhookUrl() != null ? request.getWebhookUrl().trim() : null;
-        if (webhookUrl != null) validateWebhookUrl(webhookUrl);
+        // Webhook validation removed for local dev
 
         RegisteredApp app = RegisteredApp.builder()
                 .appName(request.getName().trim())

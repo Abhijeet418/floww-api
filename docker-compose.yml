@@ -1,42 +1,68 @@
+# Local Exchange Stack
+# Usage: docker-compose up -d
+# Depends: docker network create broker-local
+
 services:
   exchange:
     build: .
     ports:
-      - "8081:8081"
+      - "8080:8080"  
     environment:
-      JAVA_OPTS: -Xms512m -Xmx1536m
-      SPRING_DATASOURCE_URL: jdbc:postgresql://timescaledb:5432/floww
+      JAVA_TOOL_OPTIONS: >-
+        -Xmx1536m -Xms512m
+      SPRING_DATASOURCE_URL: jdbc:postgresql://exchange-db:5432/floww
       SPRING_DATASOURCE_USERNAME: floww
-      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
-      REDIS_HOST: redis
+      SPRING_DATASOURCE_PASSWORD: floww1234$$
+      SPRING_PROFILES_ACTIVE: prod
+      REDIS_HOST: exchange-redis
       REDIS_PORT: 6379
-      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      ADMIN_TOKEN: 38a94e387fcd7f75c53d746d49f4ea76583e1b4902dcbfe332c76a7401870fdd
     depends_on:
-      timescaledb:
+      exchange-db:
         condition: service_healthy
-      redis:
+      exchange-redis:
         condition: service_healthy
     restart: unless-stopped
 
-  timescaledb:
+  exchange-db:
     image: timescale/timescaledb:latest-pg16
     environment:
       POSTGRES_USER: floww
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: floww1234$$
       POSTGRES_DB: floww
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_buffers=256MB
+      -c max_wal_size=512MB
+      -c checkpoint_completion_target=0.9
+      -c work_mem=4MB
+      -c maintenance_work_mem=128MB
+      -c effective_cache_size=512MB
     volumes:
-      - timescale_data:/var/lib/postgresql/data
-      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+      - local-timescale-data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./scripts/starter.sql:/docker-entrypoint-initdb.d/02-starter.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U floww"]
       interval: 10s
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g
 
-  redis:
+  exchange-redis:
     image: redis:7-alpine
+<<<<<<< Updated upstream
     command: redis-server --maxmemory 100mb --maxmemory-policy allkeys-lru
+=======
+    command: redis-server --maxmemory 100mb --maxmemory-policy allkeys-lru --save 60 100 --appendonly yes --dir /data
+    volumes:
+      - local-exchange-redis-data:/data
+>>>>>>> Stashed changes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -45,4 +71,9 @@ services:
     restart: unless-stopped
 
 volumes:
+<<<<<<< Updated upstream
   timescale_data:
+=======
+  local-timescale-data:
+  local-exchange-redis-data:
+>>>>>>> Stashed changes

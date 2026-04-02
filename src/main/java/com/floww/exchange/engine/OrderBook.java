@@ -6,6 +6,7 @@ import com.floww.exchange.model.enums.OrderSide;
 import com.floww.exchange.model.enums.OrderType;
 import com.floww.exchange.model.event.TradeEvent;
 import lombok.Getter;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 
 import java.time.Instant;
@@ -33,27 +34,52 @@ public class OrderBook {
     // O(1) lookup for cancellations
     private final HashMap<UUID, OrderBookEntry> orderIndex = new HashMap<>();
 
+    // Thread-safe snapshot: updated on the engine thread after mutations,
+    // read by the scheduled SnapshotService thread (volatile ensures visibility).
+    private volatile OrderBookSnapshot cachedSnapshot;
+
     @Getter private long lastTradedPrice = 0;
     @Getter private long sessionVolume = 0;
+
+    // Circuit breaker: triggers when a fill deviates >20% from the reference price
+    private static final long CB_DENOMINATOR = 5; // 1/5 = 20%
+    @Getter private long referencePrice = 0;
+    @Getter @Setter private boolean circuitBreakerTriggered = false;
 
     public OrderBook(String ticker) {
         this.ticker = ticker;
     }
 
     /**
+     * Sets the fixed reference price for circuit breaker checks.
+     * Typically the session open price from the DB.
+     * If not set, the first trade price auto-sets it.
+     */
+    public void setReferencePrice(long price) {
+        if (price > 0) this.referencePrice = price;
+    }
+
+    /**
      * Process an incoming order. Returns list of trades generated.
      */
     public List<TradeEvent> processOrder(OrderBookEntry entry) {
+        List<TradeEvent> trades;
         if (entry.getOrderType() == OrderType.MARKET) {
-            return matchMarketOrder(entry);
+            trades = matchMarketOrder(entry);
         } else {
-            return matchLimitOrder(entry);
+            trades = matchLimitOrder(entry);
         }
+        refreshSnapshot();
+        return trades;
     }
 
-    public boolean cancelOrder(UUID orderId) {
+    /**
+     * Cancel and return the entry, or null if not found.
+     * Returning the entry lets the engine build the response and complete the future.
+     */
+    public OrderBookEntry cancelOrder(UUID orderId) {
         OrderBookEntry entry = orderIndex.remove(orderId);
-        if (entry == null) return false;
+        if (entry == null) return null;
 
         TreeMap<Long, ArrayDeque<OrderBookEntry>> book = entry.getSide() == OrderSide.BUY ? bids : asks;
         ArrayDeque<OrderBookEntry> level = book.get(entry.getPrice());
@@ -61,7 +87,8 @@ public class OrderBook {
             level.remove(entry);
             if (level.isEmpty()) book.remove(entry.getPrice());
         }
-        return true;
+        refreshSnapshot();
+        return entry;
     }
 
     private List<TradeEvent> matchMarketOrder(OrderBookEntry aggressor) {
@@ -89,6 +116,8 @@ public class OrderBook {
 
             lastTradedPrice = fillPrice;
             sessionVolume += fillQty;
+
+            if (checkCircuitBreaker(fillPrice)) break;
         }
         // Any remaining qty for a market order is discarded (no resting for market)
         return trades;
@@ -127,6 +156,8 @@ public class OrderBook {
 
             lastTradedPrice = fillPrice;
             sessionVolume += fillQty;
+
+            if (checkCircuitBreaker(fillPrice)) break;
         }
 
         // Rest any unfilled qty
@@ -141,6 +172,23 @@ public class OrderBook {
         TreeMap<Long, ArrayDeque<OrderBookEntry>> book = entry.getSide() == OrderSide.BUY ? bids : asks;
         book.computeIfAbsent(entry.getPrice(), k -> new ArrayDeque<>()).addLast(entry);
         orderIndex.put(entry.getOrderId(), entry);
+    }
+
+    /**
+     * Checks if the fill price breaches the 20% circuit breaker threshold.
+     * The first trade of the session auto-sets the reference if not already configured.
+     */
+    private boolean checkCircuitBreaker(long fillPrice) {
+        if (referencePrice == 0) {
+            referencePrice = fillPrice;
+            return false;
+        }
+        // Rearranged to avoid overflow: |fill - ref| > ref / denom  (instead of |fill - ref| * denom > ref)
+        if (Math.abs(fillPrice - referencePrice) > referencePrice / CB_DENOMINATOR) {
+            circuitBreakerTriggered = true;
+            return true;
+        }
+        return false;
     }
 
     private TradeEvent createTrade(OrderBookEntry aggressor, OrderBookEntry resting, long price, long qty) {
@@ -162,7 +210,11 @@ public class OrderBook {
                 .build();
     }
 
-    public OrderBookSnapshot toSnapshot() {
+    /**
+     * Builds a snapshot from the current book state.
+     * MUST only be called from the engine thread (single-writer).
+     */
+    private void refreshSnapshot() {
         List<OrderBookSnapshot.PriceLevel> bidLevels = new ArrayList<>();
         for (var entry : bids.entrySet()) {
             long totalQty = entry.getValue().stream().mapToLong(OrderBookEntry::getRemainingQty).sum();
@@ -179,10 +231,18 @@ public class OrderBook {
             if (askLevels.size() >= 20) break;
         }
 
-        return OrderBookSnapshot.builder()
+        cachedSnapshot = OrderBookSnapshot.builder()
                 .ticker(ticker).bids(bidLevels).asks(askLevels)
                 .timestamp(Instant.now()).exchangeType("SIMULATED")
                 .build();
+    }
+
+    /**
+     * Returns the last snapshot built on the engine thread.
+     * Thread-safe — reads a volatile reference to an immutable object.
+     */
+    public OrderBookSnapshot toSnapshot() {
+        return cachedSnapshot;
     }
 
     public MarketDataEvent toMarketData() {
@@ -201,6 +261,12 @@ public class OrderBook {
      */
     public void insertWithoutMatching(OrderBookEntry entry) {
         addToBook(entry);
+        refreshSnapshot();
         log.debug("[{}] Recovered order {} @ {} qty={}", ticker, entry.getOrderId(), entry.getPrice(), entry.getRemainingQty());
+    }
+
+    /** Returns all resting order entries (for cleanup/purge operations). */
+    public List<OrderBookEntry> getAllRestingOrders() {
+        return new ArrayList<>(orderIndex.values());
     }
 }

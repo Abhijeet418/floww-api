@@ -9,7 +9,7 @@ import com.floww.exchange.repository.RegisteredAppRepository;
 import com.floww.exchange.repository.WebhookDeliveryRepository;
 import com.lmax.disruptor.EventHandler;
 import jakarta.annotation.PostConstruct;
-import lombok.RequiredArgsConstructor;
+import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -22,13 +22,15 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Webhook dispatch — consumes trades from the Disruptor and delivers
  * webhook notifications to registered apps asynchronously.
  */
 @Component
-@RequiredArgsConstructor
 @Slf4j
 public class WebhookDispatchHandler implements EventHandler<TradeEventHolder> {
 
@@ -41,6 +43,24 @@ public class WebhookDispatchHandler implements EventHandler<TradeEventHolder> {
 
     // Resolved at startup: appIds of simulator bots that must not receive webhooks.
     private final Set<UUID> simulatorAppIds = new HashSet<>();
+
+    // Offload blocking DB work off the Disruptor thread to prevent backpressure
+    // that cascades into blocking all Tomcat threads under high trade throughput.
+    private final ExecutorService webhookExecutor = Executors.newVirtualThreadPerTaskExecutor();
+
+    public WebhookDispatchHandler(RegisteredAppRepository appRepository,
+                                  WebhookDeliveryRepository deliveryRepository,
+                                  WebClient webClient,
+                                  ObjectMapper objectMapper,
+                                  ExchangeProperties exchangeProperties,
+                                  StringRedisTemplate redisTemplate) {
+        this.appRepository = appRepository;
+        this.deliveryRepository = deliveryRepository;
+        this.webClient = webClient;
+        this.objectMapper = objectMapper;
+        this.exchangeProperties = exchangeProperties;
+        this.redisTemplate = redisTemplate;
+    }
 
     @PostConstruct
     public void resolveSimulatorAppIds() {
@@ -57,12 +77,23 @@ public class WebhookDispatchHandler implements EventHandler<TradeEventHolder> {
 
     @Override
     public void onEvent(TradeEventHolder holder, long sequence, boolean endOfBatch) {
-        // Deliver a tailored payload to each side — no counterparty identity exposed.
-        dispatch(holder, holder.buyerAppId,  holder.buyOrderId,  "BUY");
-        dispatch(holder, holder.sellerAppId, holder.sellOrderId, "SELL");
+        // Skip cancellation-only events (no trade data)
+        if (holder.tradeId == null) return;
+        // Snapshot data from the ring buffer slot BEFORE returning —
+        // the Disruptor will reuse this slot once all handlers return.
+        var snapshot = new TradeSnapshot(
+                holder.tradeId, holder.ticker, holder.price, holder.qty,
+                holder.buyerAppId, holder.buyOrderId,
+                holder.sellerAppId, holder.sellOrderId,
+                holder.tradedAt);
+
+        webhookExecutor.submit(() -> {
+            dispatch(snapshot, snapshot.buyerAppId,  snapshot.buyOrderId,  "BUY");
+            dispatch(snapshot, snapshot.sellerAppId, snapshot.sellOrderId, "SELL");
+        });
     }
 
-    private void dispatch(TradeEventHolder holder, UUID appId, UUID ownOrderId, String side) {
+    private void dispatch(TradeSnapshot trade, UUID appId, UUID ownOrderId, String side) {
         if (simulatorAppIds.contains(appId)) return;
         try {
             Optional<RegisteredApp> appOpt = appRepository.findById(appId);
@@ -71,17 +102,17 @@ public class WebhookDispatchHandler implements EventHandler<TradeEventHolder> {
             RegisteredApp app = appOpt.get();
 
             WebhookTradePayload payload = WebhookTradePayload.builder()
-                    .tradeId(holder.tradeId)
-                    .ticker(holder.ticker)
-                    .price(holder.price)
-                    .qty(holder.qty)
+                    .tradeId(trade.tradeId)
+                    .ticker(trade.ticker)
+                    .price(trade.price)
+                    .qty(trade.qty)
                     .orderId(ownOrderId)
                     .side(side)
-                    .tradedAt(holder.tradedAt)
+                    .tradedAt(trade.tradedAt)
                     .build();
 
             WebhookDelivery delivery = WebhookDelivery.builder()
-                    .appId(appId).tradeId(holder.tradeId)
+                    .appId(appId).tradeId(trade.tradeId)
                     .payload(objectMapper.writeValueAsString(payload)).status("PENDING")
                     .attempts(0).nextRetry(Instant.now())
                     .build();
@@ -91,6 +122,12 @@ public class WebhookDispatchHandler implements EventHandler<TradeEventHolder> {
         } catch (Exception e) {
             log.warn("Webhook setup failed for app {}: {}", appId, e.getMessage());
         }
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        webhookExecutor.shutdown();
+        try { webhookExecutor.awaitTermination(5, TimeUnit.SECONDS); } catch (InterruptedException ignored) {}
     }
 
     @Scheduled(fixedRate = 5000)
@@ -128,4 +165,10 @@ public class WebhookDispatchHandler implements EventHandler<TradeEventHolder> {
                         }
                 );
     }
+
+    private record TradeSnapshot(
+            UUID tradeId, String ticker, long price, long qty,
+            UUID buyerAppId, UUID buyOrderId,
+            UUID sellerAppId, UUID sellOrderId,
+            Instant tradedAt) {}
 }

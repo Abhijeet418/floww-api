@@ -156,11 +156,3 @@ src/main/java/com/floww/exchange/
 ├── seed/            Historical candle data seeder
 └── service/         Business logic
 ```
-
-<<<<<<< Updated upstream
----
-=======
-## License
-
-MIT
->>>>>>> Stashed changes
